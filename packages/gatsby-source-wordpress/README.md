@@ -50,4 +50,4 @@ This plugin works by merging the [WPGraphQL schema & data](https://docs.wpgraphq
 - [WPGatsby](https://github.com/gatsbyjs/wp-gatsby)
 - [WPGraphQL](https://github.com/wp-graphql/wp-graphql)
 - [Gatsby](https://www.gatsbyjs.com/)
-- [WordPress](https://wordpress.com/)
+- [WordPress](https://wordpress.org/)
