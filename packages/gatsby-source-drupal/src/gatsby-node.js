@@ -2,6 +2,7 @@ const got = require(`got`)
 const _ = require(`lodash`)
 const urlJoin = require(`url-join`)
 import HttpAgent from "agentkeepalive"
+// const http2wrapper = require(`http2-wrapper`)
 
 const { HttpsAgent } = HttpAgent
 
@@ -18,10 +19,17 @@ const { handleReferences, handleWebhookUpdate } = require(`./utils`)
 const agent = {
   http: new HttpAgent(),
   https: new HttpsAgent(),
+  // http2: new http2wrapper.Agent(),
 }
 
 async function worker([url, options]) {
-  return got(url, { agent, ...options })
+  return got(url, {
+    agent,
+    cache: false,
+    // request: http2wrapper.auto,
+    // http2: true,
+    ...options,
+  })
 }
 
 const requestQueue = require(`fastq`).promise(worker, 20)
@@ -103,7 +111,7 @@ exports.sourceNodes = async (
     changesActivity.start()
 
     try {
-      const { secret, action, id, data } = webhookBody
+      const { secret, action, data } = webhookBody
       if (pluginOptions.secret && pluginOptions.secret !== secret) {
         reporter.warn(
           `The secret in this request did not match your plugin options secret.`
@@ -112,8 +120,27 @@ exports.sourceNodes = async (
         return
       }
       if (action === `delete`) {
-        actions.deleteNode(getNode(createNodeId(id)))
-        reporter.log(`Deleted node: ${id}`)
+        let nodesToDelete = data
+        if (!Array.isArray(data)) {
+          nodesToDelete = [data]
+        }
+
+        for (const nodeToDelete of nodesToDelete) {
+          const nodeIdToDelete = createNodeId(
+            createNodeIdWithVersion(
+              nodeToDelete.id,
+              nodeToDelete.type,
+              getOptions().languageConfig
+                ? nodeToDelete.attributes?.langcode
+                : `und`,
+              nodeToDelete.attributes?.drupal_internal__revision_id,
+              entityReferenceRevisions
+            )
+          )
+          actions.deleteNode(getNode(nodeIdToDelete))
+          reporter.log(`Deleted node: ${nodeIdToDelete}`)
+        }
+
         changesActivity.end()
         return
       }
@@ -170,10 +197,13 @@ exports.sourceNodes = async (
           headers,
           searchParams: params,
           responseType: `json`,
-          cache,
         },
       ])
 
+      // Fastbuilds returns a -1 if:
+      // - the timestamp has expired
+      // - if old fastbuild logs were purged
+      // - it's been a really long time since you synced so you just do a full fetch.
       if (res.body.status === -1) {
         // The incremental data is expired or this is the first fetch.
         reporter.info(`Unable to pull incremental data changes from Drupal`)
@@ -267,11 +297,11 @@ exports.sourceNodes = async (
         headers,
         searchParams: params,
         responseType: `json`,
-        cache,
       },
     ])
     allData = await Promise.all(
       _.map(res.body.links, async (url, type) => {
+        const dataArray = []
         if (disallowedLinkTypes.includes(type)) return
         if (!url) return
         if (!type) return
@@ -281,7 +311,7 @@ exports.sourceNodes = async (
           entityType => entityType === type
         )
 
-        const getNext = async (url, data = []) => {
+        const getNext = async url => {
           if (typeof url === `object`) {
             // url can be string or object containing href field
             url = url.href
@@ -315,37 +345,33 @@ exports.sourceNodes = async (
                 password: basicAuth.password,
                 headers,
                 responseType: `json`,
-                cache,
               },
             ])
           } catch (error) {
             if (error.response && error.response.statusCode == 405) {
               // The endpoint doesn't support the GET method, so just skip it.
-              return []
+              return
             } else {
               console.error(`Failed to fetch ${url}`, error.message)
               console.log(error)
               throw error
             }
           }
-          data = data.concat(d.body.data)
+          dataArray.push(...d.body.data)
           // Add support for includes. Includes allow entity data to be expanded
           // based on relationships. The expanded data is exposed as `included`
           // in the JSON API response.
           // See https://www.drupal.org/docs/8/modules/jsonapi/includes
           if (d.body.included) {
-            data = data.concat(d.body.included)
+            dataArray.push(...d.body.included)
           }
           if (d.body.links && d.body.links.next) {
-            data = await getNext(d.body.links.next, data)
+            await getNext(d.body.links.next)
           }
-
-          return data
         }
 
-        let data = []
         if (isTranslatable === false) {
-          data = await getNext(url)
+          await getNext(url)
         } else {
           for (let i = 0; i < languageConfig.enabledLanguages.length; i++) {
             let currentLanguage = languageConfig.enabledLanguages[i]
@@ -366,15 +392,14 @@ exports.sourceNodes = async (
               apiBase,
               urlPath
             )
-            const dataForLanguage = await getNext(joinedUrl)
 
-            data = data.concat(dataForLanguage)
+            await getNext(joinedUrl)
           }
         }
 
         const result = {
           type,
-          data,
+          data: dataArray,
         }
 
         // eslint-disable-next-line consistent-return

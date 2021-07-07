@@ -1,6 +1,8 @@
 import * as path from "path"
 import fs from "fs-extra"
+import type { watch as ChokidarWatchType } from "chokidar"
 import { DocumentNode } from "graphql"
+import { CombinedState } from "redux"
 import { build } from "../../../schema"
 import sourceNodesAndRemoveStaleNodes from "../../source-nodes"
 import { saveStateForWorkers, store } from "../../../redux"
@@ -11,9 +13,7 @@ import {
   GatsbyTestWorkerPool,
 } from "./test-helpers"
 import { getDataStore } from "../../../datastore"
-import { CombinedState } from "redux"
 import { IGatsbyState } from "../../../redux/types"
-import type { watch as ChokidarWatchType } from "chokidar"
 
 let worker: GatsbyTestWorkerPool | undefined
 
@@ -42,23 +42,22 @@ describeWhenLMDB(`worker (schema)`, () => {
 
   beforeAll(async () => {
     store.dispatch({ type: `DELETE_CACHE` })
-    const fileDir = path.join(process.cwd(), `.cache/redux`)
+    const fileDir = path.join(process.cwd(), `.cache/worker`)
     await fs.emptyDir(fileDir)
 
     worker = createTestWorker()
 
     const siteDirectory = path.join(__dirname, `fixtures`, `sample-site`)
     await loadConfigAndPlugins({ siteDirectory })
-    await worker.loadConfigAndPlugins({ siteDirectory })
+    await Promise.all(worker.all.loadConfigAndPlugins({ siteDirectory }))
     await sourceNodesAndRemoveStaleNodes({ webhookBody: {} })
     await getDataStore().ready()
 
     await build({ parentSpan: {} })
-
     saveStateForWorkers([`inferenceMetadata`])
-    await worker.buildSchema()
+    await Promise.all(worker.all.buildSchema())
 
-    stateFromWorker = await worker.getState()
+    stateFromWorker = await worker.single.getState()
   })
 
   afterAll(() => {
@@ -131,7 +130,7 @@ describeWhenLMDB(`worker (schema)`, () => {
 
   it(`should have resolverField from createResolvers`, async () => {
     // @ts-ignore - it exists
-    const { data } = await worker?.getRunQueryResult(`
+    const { data } = await worker?.single.getRunQueryResult(`
     {
       one: nodeTypeOne {
         number
@@ -152,7 +151,7 @@ describeWhenLMDB(`worker (schema)`, () => {
 
   it(`should have fieldsOnGraphQL from setFieldsOnGraphQLNodeType`, async () => {
     // @ts-ignore - it exists
-    const { data } = await worker?.getRunQueryResult(`
+    const { data } = await worker?.single.getRunQueryResult(`
     {
       four: nodeTypeOne {
         fieldsOnGraphQL

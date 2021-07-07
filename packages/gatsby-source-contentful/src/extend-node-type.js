@@ -32,7 +32,8 @@ const {
 // cache is more likely to go stale than the images (which never go stale)
 // Note that the same image might be requested multiple times in the same run
 
-const validImageFormats = new Set([`jpg`, `png`, `webp`])
+// Supported Image Formats from https://www.contentful.com/developers/docs/references/images-api/#/reference/changing-formats/image-format
+const validImageFormats = new Set([`jpg`, `png`, `webp`, `gif`])
 
 if (process.env.GATSBY_REMOTE_CACHE) {
   console.warn(
@@ -75,7 +76,7 @@ const getBase64Image = (imageProps, reporter) => {
     return null
   }
 
-  const requestUrl = `https:${imageProps.baseUrl}?w=20`
+  const requestUrl = `https:${imageProps.baseUrl}?w=20&fm=jpg`
 
   // Prefer to return data sync if we already have it
   const alreadyFetched = resolvedBase64Cache.get(requestUrl)
