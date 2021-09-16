@@ -5,7 +5,7 @@ import { DocumentNode } from "graphql"
 import { CombinedState } from "redux"
 import { build } from "../../../schema"
 import sourceNodesAndRemoveStaleNodes from "../../source-nodes"
-import { saveStateForWorkers, store } from "../../../redux"
+import { savePartialStateToDisk, store } from "../../../redux"
 import { loadConfigAndPlugins } from "../../../bootstrap/load-config-and-plugins"
 import {
   createTestWorker,
@@ -37,6 +37,14 @@ jest.mock(`chokidar`, () => {
   return chokidar
 })
 
+jest.mock(`gatsby-telemetry`, () => {
+  return {
+    decorateEvent: jest.fn(),
+    trackError: jest.fn(),
+    trackCli: jest.fn(),
+  }
+})
+
 describeWhenLMDB(`worker (schema)`, () => {
   let stateFromWorker: CombinedState<IGatsbyState>
 
@@ -54,7 +62,7 @@ describeWhenLMDB(`worker (schema)`, () => {
     await getDataStore().ready()
 
     await build({ parentSpan: {} })
-    saveStateForWorkers([`inferenceMetadata`])
+    savePartialStateToDisk([`inferenceMetadata`])
     await Promise.all(worker.all.buildSchema())
 
     stateFromWorker = await worker.single.getState()
@@ -71,9 +79,11 @@ describeWhenLMDB(`worker (schema)`, () => {
   })
 
   it(`should have functioning createSchemaCustomization`, async () => {
-    const typeDefinitions = (stateFromWorker.schemaCustomization.types[0] as {
-      typeOrTypeDef: DocumentNode
-    }).typeOrTypeDef.definitions
+    const typeDefinitions = (
+      stateFromWorker.schemaCustomization.types[0] as {
+        typeOrTypeDef: DocumentNode
+      }
+    ).typeOrTypeDef.definitions
 
     expect(typeDefinitions).toEqual(
       expect.arrayContaining([

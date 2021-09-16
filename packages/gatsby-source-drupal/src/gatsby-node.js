@@ -3,18 +3,19 @@ const _ = require(`lodash`)
 const urlJoin = require(`url-join`)
 import HttpAgent from "agentkeepalive"
 // const http2wrapper = require(`http2-wrapper`)
+const opentracing = require(`opentracing`)
+const { SemanticAttributes } = require(`@opentelemetry/semantic-conventions`)
 
 const { HttpsAgent } = HttpAgent
 
 const { setOptions, getOptions } = require(`./plugin-options`)
 
+const { nodeFromData, downloadFile, isFileNode } = require(`./normalize`)
 const {
-  nodeFromData,
-  downloadFile,
-  isFileNode,
-  createNodeIdWithVersion,
-} = require(`./normalize`)
-const { handleReferences, handleWebhookUpdate } = require(`./utils`)
+  handleReferences,
+  handleWebhookUpdate,
+  handleDeletedNode,
+} = require(`./utils`)
 
 const agent = {
   http: new HttpAgent(),
@@ -22,14 +23,61 @@ const agent = {
   // http2: new http2wrapper.Agent(),
 }
 
+let start
+let apiRequestCount = 0
+let initialSourcing = true
+let globalReporter
 async function worker([url, options]) {
-  return got(url, {
+  const tracer = opentracing.globalTracer()
+  const httpSpan = tracer.startSpan(`http.get`, {
+    childOf: options.parentSpan,
+  })
+  const parsedUrl = new URL(url)
+  httpSpan.setTag(SemanticAttributes.HTTP_URL, url)
+  httpSpan.setTag(SemanticAttributes.HTTP_HOST, parsedUrl.host)
+  httpSpan.setTag(
+    SemanticAttributes.HTTP_SCHEME,
+    parsedUrl.protocol.replace(/:$/, ``)
+  )
+  httpSpan.setTag(SemanticAttributes.HTTP_TARGET, parsedUrl.pathname)
+  httpSpan.setTag(`plugin`, `gatsby-source-drupal`)
+
+  // Log out progress during the initial sourcing.
+  if (initialSourcing) {
+    apiRequestCount += 1
+    if (!start) {
+      start = Date.now()
+    }
+    const queueLength = requestQueue.length()
+    if (apiRequestCount % 50 === 0) {
+      globalReporter.verbose(
+        `gatsby-source-drupal has ${queueLength} API requests queued and the current request rate is ${(
+          apiRequestCount /
+          ((Date.now() - start) / 1000)
+        ).toFixed(2)} requests / second`
+      )
+    }
+  }
+
+  const response = await got(url, {
     agent,
     cache: false,
     // request: http2wrapper.auto,
     // http2: true,
     ...options,
   })
+
+  httpSpan.setTag(SemanticAttributes.HTTP_STATUS_CODE, response.statusCode)
+  httpSpan.setTag(SemanticAttributes.HTTP_METHOD, `GET`)
+  httpSpan.setTag(SemanticAttributes.NET_PEER_IP, response.ip)
+  httpSpan.setTag(
+    SemanticAttributes.HTTP_RESPONSE_CONTENT_LENGTH,
+    response.rawBody?.length
+  )
+
+  httpSpan.finish()
+
+  return response
 }
 
 const requestQueue = require(`fastq`).promise(worker, 20)
@@ -72,6 +120,9 @@ exports.sourceNodes = async (
   },
   pluginOptions
 ) => {
+  const tracer = opentracing.globalTracer()
+
+  globalReporter = reporter
   const {
     baseUrl,
     apiBase = `jsonapi`,
@@ -94,6 +145,7 @@ exports.sourceNodes = async (
       defaultLanguage: `und`,
       enabledLanguages: [`und`],
       translatableEntities: [],
+      nonTranslatableEntities: [],
     },
   } = pluginOptions
   const { createNode, setPluginStatus, touchNode } = actions
@@ -119,6 +171,20 @@ exports.sourceNodes = async (
         changesActivity.end()
         return
       }
+
+      if (!action || !data) {
+        reporter.warn(
+          `The webhook body was malformed
+
+${JSON.stringify(webhookBody, null, 4)}
+
+          `
+        )
+
+        changesActivity.end()
+        return
+      }
+
       if (action === `delete`) {
         let nodesToDelete = data
         if (!Array.isArray(data)) {
@@ -126,19 +192,15 @@ exports.sourceNodes = async (
         }
 
         for (const nodeToDelete of nodesToDelete) {
-          const nodeIdToDelete = createNodeId(
-            createNodeIdWithVersion(
-              nodeToDelete.id,
-              nodeToDelete.type,
-              getOptions().languageConfig
-                ? nodeToDelete.attributes?.langcode
-                : `und`,
-              nodeToDelete.attributes?.drupal_internal__revision_id,
-              entityReferenceRevisions
-            )
-          )
-          actions.deleteNode(getNode(nodeIdToDelete))
-          reporter.log(`Deleted node: ${nodeIdToDelete}`)
+          const deletedNode = await handleDeletedNode({
+            actions,
+            getNode,
+            node: nodeToDelete,
+            createNodeId,
+            createContentDigest,
+            entityReferenceRevisions,
+          })
+          reporter.log(`Deleted node: ${deletedNode.id}`)
         }
 
         changesActivity.end()
@@ -176,12 +238,23 @@ exports.sourceNodes = async (
   }
 
   if (fastBuilds) {
+    const fastBuildsSpan = tracer.startSpan(`sourceNodes.fetch`, {
+      childOf: parentSpan,
+    })
+    fastBuildsSpan.setTag(`plugin`, `gatsby-source-drupal`)
+    fastBuildsSpan.setTag(`sourceNodes.fetch.type`, `delta`)
+
     const lastFetched =
       store.getState().status.plugins?.[`gatsby-source-drupal`]?.lastFetched ??
       0
 
+    reporter.verbose(
+      `[gatsby-source-drupal]: value of lastFetched for fastbuilds "${lastFetched}"`
+    )
+
     const drupalFetchIncrementalActivity = reporter.activityTimer(
-      `Fetch incremental changes from Drupal`
+      `Fetch incremental changes from Drupal`,
+      { parentSpan: fastBuildsSpan }
     )
     let requireFullRebuild = false
 
@@ -197,6 +270,7 @@ exports.sourceNodes = async (
           headers,
           searchParams: params,
           responseType: `json`,
+          parentSpan: fastBuildsSpan,
         },
       ])
 
@@ -210,32 +284,44 @@ exports.sourceNodes = async (
         setPluginStatus({ lastFetched: res.body.timestamp })
         requireFullRebuild = true
       } else {
+        const touchNodesSpan = tracer.startSpan(`sourceNodes.touchNodes`, {
+          childOf: fastBuildsSpan,
+        })
+        touchNodesSpan.setTag(`plugin`, `gatsby-source-drupal`)
+
         // Touch nodes so they are not garbage collected by Gatsby.
+        let touchCount = 0
         getNodes().forEach(node => {
           if (node.internal.owner === `gatsby-source-drupal`) {
+            touchCount += 1
             touchNode(node)
           }
         })
+        touchNodesSpan.setTag(`sourceNodes.touchNodes.count`, touchCount)
+        touchNodesSpan.finish()
+
+        const createNodesSpan = tracer.startSpan(`sourceNodes.createNodes`, {
+          childOf: parentSpan,
+        })
+        createNodesSpan.setTag(`plugin`, `gatsby-source-drupal`)
+        createNodesSpan.setTag(`sourceNodes.fetch.type`, `delta`)
+        createNodesSpan.setTag(
+          `sourceNodes.createNodes.count`,
+          res.body.entities?.length
+        )
 
         // Process sync data from Drupal.
         const nodesToSync = res.body.entities
         for (const nodeSyncData of nodesToSync) {
           if (nodeSyncData.action === `delete`) {
-            actions.deleteNode(
-              getNode(
-                createNodeId(
-                  createNodeIdWithVersion(
-                    nodeSyncData.id,
-                    nodeSyncData.type,
-                    getOptions().languageConfig
-                      ? nodeSyncData.attributes.langcode
-                      : `und`,
-                    nodeSyncData.attributes?.drupal_internal__revision_id,
-                    entityReferenceRevisions
-                  )
-                )
-              )
-            )
+            handleDeletedNode({
+              actions,
+              getNode,
+              node: nodeSyncData,
+              createNodeId,
+              createContentDigest,
+              entityReferenceRevisions,
+            })
           } else {
             // The data could be a single Drupal entity or an array of Drupal
             // entities to update.
@@ -264,14 +350,19 @@ exports.sourceNodes = async (
           }
         }
 
+        createNodesSpan.finish()
         setPluginStatus({ lastFetched: res.body.timestamp })
       }
     } catch (e) {
       gracefullyRethrow(drupalFetchIncrementalActivity, e)
+
+      drupalFetchIncrementalActivity.end()
+      fastBuildsSpan.finish()
       return
     }
 
     drupalFetchIncrementalActivity.end()
+    fastBuildsSpan.finish()
 
     if (!requireFullRebuild) {
       return
@@ -279,8 +370,14 @@ exports.sourceNodes = async (
   }
 
   const drupalFetchActivity = reporter.activityTimer(
-    `Fetch all data from Drupal`
+    `Fetch all data from Drupal`,
+    { parentSpan }
   )
+  const fullFetchSpan = tracer.startSpan(`sourceNodes.fetch`, {
+    childOf: parentSpan,
+  })
+  fullFetchSpan.setTag(`plugin`, `gatsby-source-drupal`)
+  fullFetchSpan.setTag(`sourceNodes.fetch.type`, `full`)
 
   // Fetch articles.
   reporter.info(`Starting to fetch all data from Drupal`)
@@ -288,6 +385,7 @@ exports.sourceNodes = async (
   drupalFetchActivity.start()
 
   let allData
+  const typeRequestsQueued = new Set()
   try {
     const res = await requestQueue.push([
       urlJoin(baseUrl, apiBase),
@@ -297,6 +395,7 @@ exports.sourceNodes = async (
         headers,
         searchParams: params,
         responseType: `json`,
+        parentSpan: fullFetchSpan,
       },
     ])
     allData = await Promise.all(
@@ -345,6 +444,7 @@ exports.sourceNodes = async (
                 password: basicAuth.password,
                 headers,
                 responseType: `json`,
+                parentSpan: fullFetchSpan,
               },
             ])
           } catch (error) {
@@ -365,7 +465,39 @@ exports.sourceNodes = async (
           if (d.body.included) {
             dataArray.push(...d.body.included)
           }
-          if (d.body.links && d.body.links.next) {
+
+          // If JSON:API extras is configured to add the resource count, we can queue
+          // all API requests immediately instead of waiting for each request to return
+          // the next URL. This lets us request resources in parallel vs. sequentially
+          // which is much faster.
+          if (d.body.meta?.count) {
+            // If we hadn't added urls yet
+            if (d.body.links.next?.href && !typeRequestsQueued.has(type)) {
+              typeRequestsQueued.add(type)
+
+              // Get count of API requests
+              // We round down as we've already gotten the first page at this point.
+              const pageSize = new URL(d.body.links.next.href).searchParams.get(
+                `page[limit]`
+              )
+              const requestsCount = Math.floor(d.body.meta.count / pageSize)
+
+              reporter.verbose(
+                `queueing ${requestsCount} API requests for type ${type} which has ${d.body.meta.count} entities.`
+              )
+
+              const newUrl = new URL(d.body.links.next.href)
+              await Promise.all(
+                _.range(requestsCount).map(pageOffset => {
+                  // We're starting 1 ahead.
+                  pageOffset += 1
+                  // Construct URL with new pageOffset.
+                  newUrl.searchParams.set(`page[offset]`, pageOffset * pageSize)
+                  return getNext(newUrl.toString())
+                })
+              )
+            }
+          } else if (d.body.links?.next) {
             await getNext(d.body.links.next)
           }
         }
@@ -412,6 +544,13 @@ exports.sourceNodes = async (
   }
 
   drupalFetchActivity.end()
+  fullFetchSpan.finish()
+
+  const createNodesSpan = tracer.startSpan(`sourceNodes.createNodes`, {
+    childOf: parentSpan,
+  })
+  createNodesSpan.setTag(`plugin`, `gatsby-source-drupal`)
+  createNodesSpan.setTag(`sourceNodes.fetch.type`, `full`)
 
   const nodes = new Map()
 
@@ -424,6 +563,8 @@ exports.sourceNodes = async (
       nodes.set(node.id, node)
     })
   })
+
+  createNodesSpan.setTag(`sourceNodes.createNodes.count`, nodes.size)
 
   // second pass - handle relationships and back references
   nodes.forEach(node => {
@@ -444,7 +585,8 @@ exports.sourceNodes = async (
 
     if (fileNodes.length) {
       const downloadingFilesActivity = reporter.activityTimer(
-        `Remote file download`
+        `Remote file download`,
+        { parentSpan }
       )
       downloadingFilesActivity.start()
       try {
@@ -476,6 +618,10 @@ exports.sourceNodes = async (
     createNode(node)
   }
 
+  // We're now done with the initial sourcing.
+  initialSourcing = false
+
+  createNodesSpan.finish()
   return
 }
 
@@ -570,5 +716,6 @@ exports.pluginOptionsSchema = ({ Joi }) =>
       defaultLanguage: Joi.string().required(),
       enabledLanguages: Joi.array().items(Joi.string()).required(),
       translatableEntities: Joi.array().items(Joi.string()).required(),
+      nonTranslatableEntities: Joi.array().items(Joi.string()).required(),
     }),
   })

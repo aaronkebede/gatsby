@@ -6,6 +6,7 @@ import { IGatsbyCLIState } from "gatsby-cli/src/reporter/redux/types"
 import { ThunkAction } from "redux-thunk"
 import { InternalJob, JobResultInterface } from "../utils/jobs/manager"
 import { ITypeMetadata } from "../schema/infer/inference-metadata"
+import { Span } from "opentracing"
 
 type SystemPath = string
 type Identifier = string
@@ -25,6 +26,8 @@ export enum ProgramStatus {
   BOOTSTRAP_QUERY_RUNNING_FINISHED = `BOOTSTRAP_QUERY_RUNNING_FINISHED`,
 }
 
+export type PageMode = "SSG" | "DSG" | "SSR"
+
 export interface IGatsbyPage {
   internalComponentName: string
   path: string
@@ -39,6 +42,7 @@ export interface IGatsbyPage {
   pluginCreatorId: Identifier
   componentPath: SystemPath
   ownerNodeId: Identifier
+  mode: PageMode
 }
 
 export interface IGatsbyFunction {
@@ -242,6 +246,8 @@ export interface IGatsbyState {
     >
     ssrAPIs: Array<"onRenderBody" | "onPreRenderHTML">
     pluginFilepath: SystemPath
+    subPluginPaths?: Array<string>
+    modulePath?: string
   }>
   config: IGatsbyConfig
   functions: Array<IGatsbyFunction>
@@ -403,6 +409,7 @@ export type ActionsUnion =
   | IMarkHtmlDirty
   | ISSRUsedUnsafeBuiltin
   | ISetSiteConfig
+  | IMergeWorkerQueryState
 
 export interface IApiFinishedAction {
   type: `API_FINISHED`
@@ -784,6 +791,9 @@ export interface ICreateNodeAction {
   type: `CREATE_NODE`
   payload: IGatsbyNode
   oldNode?: IGatsbyNode
+  traceId: string
+  parentSpan: Span
+  followsSpan: Span
 }
 
 export interface IAddFieldToNodeAction {
@@ -903,5 +913,13 @@ export interface INodeManifest {
   pluginName: string
   node: {
     id: string
+  }
+}
+
+export interface IMergeWorkerQueryState {
+  type: `MERGE_WORKER_QUERY_STATE`
+  payload: {
+    workerId: number
+    queryStateChunk: IGatsbyState["queries"]
   }
 }

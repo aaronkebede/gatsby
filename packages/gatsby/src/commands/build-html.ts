@@ -2,7 +2,7 @@ import Bluebird from "bluebird"
 import fs from "fs-extra"
 import reporter from "gatsby-cli/lib/reporter"
 import { createErrorFromString } from "gatsby-cli/lib/reporter/errors"
-import { chunk } from "lodash"
+import { chunk, truncate } from "lodash"
 import webpack, { Stats } from "webpack"
 import * as path from "path"
 
@@ -11,11 +11,15 @@ import { IWebpackWatchingPauseResume } from "../utils/start-server"
 import webpackConfig from "../utils/webpack.config"
 import { structureWebpackErrors } from "../utils/webpack-error-utils"
 import * as buildUtils from "./build-utils"
+import { getPageData } from "../utils/get-page-data"
 
 import { Span } from "opentracing"
 import { IProgram, Stage } from "./types"
+import { ROUTES_DIRECTORY } from "../constants"
 import { PackageJson } from "../.."
 import type { GatsbyWorkerPool } from "../utils/worker/pool"
+import { IPageDataWithQueryResult } from "../utils/page-data"
+import { processNodeManifests } from "../utils/node-manifest"
 
 type IActivity = any // TODO
 
@@ -29,6 +33,7 @@ export interface IBuildArgs extends IProgram {
   profile: boolean
   graphqlTracing: boolean
   openTracingConfigFile: string
+  // TODO remove in v4
   keepPageRenderer: boolean
 }
 
@@ -121,7 +126,7 @@ const runWebpack = (
             } = require(`../utils/dev-ssr/render-dev-html`)
             // Make sure we use the latest version during development
             if (oldHash !== `` && newHash !== oldHash) {
-              restartWorker(`${directory}/public/render-page.js`)
+              restartWorker(`${directory}/${ROUTES_DIRECTORY}render-page.js`)
             }
 
             oldHash = newHash
@@ -164,7 +169,7 @@ const doBuildRenderer = async (
 
   // render-page.js is hard coded in webpack.config
   return {
-    rendererPath: `${directory}/public/render-page.js`,
+    rendererPath: `${directory}/${ROUTES_DIRECTORY}render-page.js`,
     waitForCompilerClose,
   }
 }
@@ -182,6 +187,7 @@ export const buildRenderer = async (
   return doBuildRenderer(program, config, stage, parentSpan)
 }
 
+// TODO remove after v4 release and update cloud internals
 export const deleteRenderer = async (rendererPath: string): Promise<void> => {
   try {
     await fs.remove(rendererPath)
@@ -190,7 +196,6 @@ export const deleteRenderer = async (rendererPath: string): Promise<void> => {
     // This function will fail on Windows with no further consequences.
   }
 }
-
 export interface IRenderHtmlResult {
   unsafeBuiltinsUsageByPagePath: Record<string, Array<string>>
 }
@@ -304,6 +309,20 @@ class BuildHTMLError extends Error {
   }
 }
 
+const truncateObjStrings = (obj): IPageDataWithQueryResult => {
+  // Recursively truncate strings nested in object
+  // These objs can be quite large, but we want to preserve each field
+  for (const key in obj) {
+    if (typeof obj[key] === `object`) {
+      truncateObjStrings(obj[key])
+    } else if (typeof obj[key] === `string`) {
+      obj[key] = truncate(obj[key], { length: 250 })
+    }
+  }
+
+  return obj
+}
+
 export const doBuildPages = async (
   rendererPath: string,
   pagePaths: Array<string>,
@@ -318,8 +337,21 @@ export const doBuildPages = async (
       error.stack,
       `${rendererPath}.map`
     )
+
     const buildError = new BuildHTMLError(prettyError)
     buildError.context = error.context
+
+    if (error?.context?.path) {
+      const pageData = await getPageData(error.context.path)
+      const truncatedPageData = truncateObjStrings(pageData)
+
+      const pageDataMessage = `Page data from page-data.json for the failed page "${
+        error.context.path
+      }": ${JSON.stringify(truncatedPageData, null, 2)}`
+
+      reporter.error(pageDataMessage)
+    }
+
     throw buildError
   }
 }
@@ -340,16 +372,13 @@ export const buildHTML = async ({
 }): Promise<void> => {
   const { rendererPath } = await buildRenderer(program, stage, activity.span)
   await doBuildPages(rendererPath, pagePaths, activity, workerPool, stage)
-  await deleteRenderer(rendererPath)
 }
 
 export async function buildHTMLPagesAndDeleteStaleArtifacts({
-  pageRenderer,
   workerPool,
   buildSpan,
   program,
 }: {
-  pageRenderer: string
   workerPool: GatsbyWorkerPool
   buildSpan?: Span
   program: IBuildArgs
@@ -357,13 +386,11 @@ export async function buildHTMLPagesAndDeleteStaleArtifacts({
   toRegenerate: Array<string>
   toDelete: Array<string>
 }> {
+  const pageRenderer = `${program.directory}/${ROUTES_DIRECTORY}render-page.js`
   buildUtils.markHtmlDirtyIfResultOfUsedStaticQueryChanged()
 
-  const {
-    toRegenerate,
-    toDelete,
-    toCleanupFromTrackedState,
-  } = buildUtils.calcDirtyHtmlFiles(store.getState())
+  const { toRegenerate, toDelete, toCleanupFromTrackedState } =
+    buildUtils.calcDirtyHtmlFiles(store.getState())
 
   store.dispatch({
     type: `HTML_TRACKED_PAGES_CLEANUP`,
@@ -414,7 +441,7 @@ export async function buildHTMLPagesAndDeleteStaleArtifacts({
     reporter.info(`There are no new or changed html files to build.`)
   }
 
-  if (!program.keepPageRenderer) {
+  if (_CFLAGS_.GATSBY_MAJOR !== `4` && !program.keepPageRenderer) {
     try {
       await deleteRenderer(pageRenderer)
     } catch (err) {
@@ -432,6 +459,9 @@ export async function buildHTMLPagesAndDeleteStaleArtifacts({
 
     deletePageDataActivityTimer.end()
   }
+
+  // we process node manifests in this location because we need to make sure all page-data.json files are written for gatsby as well as inc-builds (both call builHTMLPagesAndDeleteStaleArtifacts). Node manifests include a digest of the corresponding page-data.json file and at this point we can be sure page-data has been written out for the latest updates in gatsby build AND inc builds.
+  await processNodeManifests()
 
   return { toRegenerate, toDelete }
 }

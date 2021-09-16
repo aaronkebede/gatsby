@@ -11,7 +11,7 @@ import _ from "lodash"
 import telemetry from "gatsby-telemetry"
 
 import { mett } from "../utils/mett"
-import thunk, { ThunkMiddleware, ThunkAction } from "redux-thunk"
+import thunk, { ThunkMiddleware, ThunkAction, ThunkDispatch } from "redux-thunk"
 import * as reducers from "./reducers"
 import { writeToCache, readFromCache } from "./persist"
 import { IGatsbyState, ActionsUnion, GatsbyStateKeys } from "./types"
@@ -41,25 +41,19 @@ export const readState = (): IGatsbyState => {
     // changes. Explicitly delete it here to cover case where user
     // runs gatsby the first time after upgrading.
     delete state[`jsonDataPaths`]
-    telemetry.decorateEvent(`BUILD_END`, {
+
+    telemetry.trackCli(`CACHE_STATUS`, {
       cacheStatus: `WARM`,
     })
-    telemetry.decorateEvent(`DEVELOP_STOP`, {
-      cacheStatus: `WARM`,
-    })
+
     return state
   } catch (e) {
-    // ignore errors.
+    telemetry.trackCli(`CACHE_STATUS`, {
+      cacheStatus: `COLD`,
+    })
+
+    return {} as IGatsbyState
   }
-  // BUG: Would this not cause downstream bugs? seems likely. Why wouldn't we just
-  // throw and kill the program?
-  telemetry.decorateEvent(`BUILD_END`, {
-    cacheStatus: `COLD`,
-  })
-  telemetry.decorateEvent(`DEVELOP_STOP`, {
-    cacheStatus: `COLD`,
-  })
-  return {} as IGatsbyState
 }
 
 export interface IMultiDispatch {
@@ -71,24 +65,23 @@ export interface IMultiDispatch {
 /**
  * Redux middleware handling array of actions
  */
-const multi: Middleware<IMultiDispatch> = ({ dispatch }) => next => (
-  action: ActionsUnion
-): ActionsUnion | Array<ActionsUnion> =>
-  Array.isArray(action) ? action.filter(Boolean).map(dispatch) : next(action)
+const multi: Middleware<IMultiDispatch> =
+  ({ dispatch }) =>
+  next =>
+  (action: ActionsUnion): ActionsUnion | Array<ActionsUnion> =>
+    Array.isArray(action) ? action.filter(Boolean).map(dispatch) : next(action)
 
-// We're using the inferred type here because manually typing it would be very complicated
-// and error-prone. Instead we'll make use of the createStore return value, and export that type.
-// eslint-disable-next-line @typescript-eslint/explicit-function-return-type
-export const configureStore = (
-  initialState: IGatsbyState
-): Store<IGatsbyState> =>
+export type GatsbyReduxStore = Store<IGatsbyState> & {
+  dispatch: ThunkDispatch<IGatsbyState, any, ActionsUnion> & IMultiDispatch
+}
+
+export const configureStore = (initialState: IGatsbyState): GatsbyReduxStore =>
   createStore(
     combineReducers<IGatsbyState>({ ...reducers }),
     initialState,
     applyMiddleware(thunk as ThunkMiddleware<IGatsbyState, ActionsUnion>, multi)
   )
 
-export type GatsbyReduxStore = ReturnType<typeof configureStore>
 export const store: GatsbyReduxStore = configureStore(
   process.env.GATSBY_WORKER_POOL_WORKER ? ({} as IGatsbyState) : readState()
 )
@@ -131,18 +124,24 @@ export const saveState = (): void => {
   })
 }
 
-export const saveStateForWorkers = (slices: Array<GatsbyStateKeys>): void => {
+export const savePartialStateToDisk = (
+  slices: Array<GatsbyStateKeys>,
+  optionalPrefix?: string,
+  transformState?: <T extends DeepPartial<IGatsbyState>>(state: T) => T
+): void => {
   const state = store.getState()
   const contents = _.pick(state, slices)
+  const savedContents = transformState ? transformState(contents) : contents
 
-  return writeToCache(contents, slices)
+  return writeToCache(savedContents, slices, optionalPrefix)
 }
 
-export const loadStateInWorker = (
-  slices: Array<GatsbyStateKeys>
+export const loadPartialStateFromDisk = (
+  slices: Array<GatsbyStateKeys>,
+  optionalPrefix?: string
 ): DeepPartial<IGatsbyState> => {
   try {
-    return readFromCache(slices) as DeepPartial<IGatsbyState>
+    return readFromCache(slices, optionalPrefix) as DeepPartial<IGatsbyState>
   } catch (e) {
     // ignore errors.
   }
